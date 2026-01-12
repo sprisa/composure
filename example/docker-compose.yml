@@ -1,6 +1,5 @@
 services:
   # Simple Hello World application
-  # composure
   hello-world:
     image: crccheck/hello-world
     ports:

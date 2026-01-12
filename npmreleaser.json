@@ -1,0 +1,32 @@
+{
+  "package.json": {
+    "name": "@sprisa/composure",
+    "version": "0.0.1",
+    "description": "Deploy docker-compose files to multiple hosts via SSH with Composure",
+    "license": "MPL-2.0",
+    "author": "Gabriel Meola <banter@gabe.mx>",
+    "keywords": [
+      "docker",
+      "docker-compose",
+      "deploy"
+    ],
+    "homepage": "https://github.com/sprisa/composure",
+    "bugs": {
+      "url": "https://github.com/sprisa/composure/issues"
+    },
+    "repository": {
+      "type": "git",
+      "url": "git+https://github.com/sprisa/composure.git"
+    }
+  },
+  "bin": "composure",
+  "gobuild": "go build -ldflags=\"-s -w\"",
+  "platforms": [
+    "linux/amd64",
+    "linux/arm64",
+    "darwin/amd64",
+    "darwin/arm64",
+    "windows/amd64",
+    "windows/arm64"
+  ]
+}

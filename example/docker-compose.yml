@@ -1,0 +1,19 @@
+services:
+  # Simple Hello World application
+  # composure
+  hello-world:
+    image: crccheck/hello-world
+    ports:
+      - "8081:8000"
+    restart: unless-stopped
+    labels:
+      composure: ssh://gabe@jackfruit.local
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+    labels:
+      composure: ssh://gabe@mango.local

@@ -92,3 +92,32 @@ Commands:
 ```
 
 
+
+## Recommendations  
+
+### Use absolute paths for Volumes
+
+Docker resolves relative paths like `./` or `~` based the machine you ran `composure up` from, **not** the host target machine. It's recommended to use explicit absolute paths for portability.
+
+*Assuming username is `ubuntu`*  
+```yaml
+services:
+  plex:
+    image: lscr.io/linuxserver/plex:latest
+    ports:
+      - 32400:32400
+    # Use absolute paths instead of related paths
+    volumes:
+      - /home/ubuntu/plex/library:/config
+      # The below is not as portable
+      # - ~/plex/library:/config
+    labels:
+      composure: ssh://ubuntu@jackfruit.dvc.link
+```
+
+
+## Not Yet Supported  
+- Cross host volumes
+- Cross host docker networks
+  - Recommended to use LAN network or an Overlay VPN
+- Cross host `service.depends_on`

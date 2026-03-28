@@ -116,8 +116,19 @@ services:
 ```
 
 
-## Not Yet Supported  
+## Multi-Host Networking
+
+Composure automatically enables cross-host service discovery. When you deploy services to different hosts, each service gets `extra_hosts` entries injected so it can resolve other services by name.
+
+For example, given services `hello-world` on `jackfruit.local` and `nginx` on `mango.local`:
+- `hello-world` can reach `nginx` at `nginx:<published-port>`
+- `nginx` can reach `hello-world` at `hello-world:<published-port>`
+
+Composure resolves each SSH host's IP at deploy time and adds the mappings automatically. Services on the same host are skipped since they already share Docker's internal network. Any existing `extra_hosts` you define are preserved.
+
+> **Note:** Services communicate over the host network using published ports, not container ports. Ensure the relevant ports are exposed and accessible between hosts.
+
+
+## Not Yet Supported
 - Cross host volumes
-- Cross host docker networks
-  - Recommended to use LAN network or an Overlay VPN
 - Cross host `service.depends_on`

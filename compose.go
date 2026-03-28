@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 
 	composeCli "github.com/compose-spec/compose-go/v2/cli"
+	"github.com/compose-spec/compose-go/v2/types"
 	l "github.com/sprisa/x/log"
 	"golang.org/x/sync/errgroup"
 )
@@ -46,11 +50,20 @@ func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
 		hostDeployment[host] = deploys
 	}
 
+	if err := injectExtraHosts(project, hostDeployment); err != nil {
+		return err
+	}
+
+	composeYAML, err := project.MarshalYAML()
+	if err != nil {
+		return err
+	}
+
 	group, ctx := errgroup.WithContext(ctx)
 
 	for host, services := range hostDeployment {
 		group.Go(func() error {
-			err := runDockerCompose(ctx, host, composeFile, cmd, flags, services)
+			err := runDockerCompose(ctx, host, composeYAML, cmd, flags, services)
 			if err != nil {
 				l.Log.Err(err).
 					Str("host", host).
@@ -67,14 +80,14 @@ func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
 func runDockerCompose(
 	ctx context.Context,
 	host string,
-	file string,
+	composeYAML []byte,
 	composeCmd string,
 	flags []string,
 	services []string,
 ) error {
 	args := []string{
 		"compose",
-		"-f", file,
+		"-f", "-",
 		composeCmd,
 	}
 	args = append(args, flags...)
@@ -86,7 +99,7 @@ func runDockerCompose(
 		args...,
 	)
 
-	// Pass through stdout and stderr
+	cmd.Stdin = bytes.NewReader(composeYAML)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = append(
@@ -101,6 +114,72 @@ func runDockerCompose(
 
 	return cmd.Run()
 }
+
+func resolveHostIP(sshURI string) (string, error) {
+	u, err := url.Parse(sshURI)
+	if err != nil {
+		return "", err
+	}
+
+	hostname := u.Hostname()
+
+	addrs, err := net.LookupHost(hostname)
+	if err != nil {
+		return hostname, nil
+	}
+
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
+			return addr, nil
+		}
+	}
+
+	if len(addrs) > 0 {
+		return addrs[0], nil
+	}
+
+	return hostname, nil
+}
+
+func injectExtraHosts(project *types.Project, hostDeployment map[string][]string) error {
+	hostIPs := map[string]string{}
+	for host := range hostDeployment {
+		ip, err := resolveHostIP(host)
+		if err != nil {
+			return err
+		}
+		hostIPs[host] = ip
+	}
+
+	serviceHost := map[string]string{}
+	for host, services := range hostDeployment {
+		for _, svc := range services {
+			serviceHost[svc] = host
+		}
+	}
+
+	for name, service := range project.Services {
+		myHost := serviceHost[name]
+
+		if service.ExtraHosts == nil {
+			service.ExtraHosts = types.HostsList{}
+		}
+
+		for otherName, otherHost := range serviceHost {
+			if otherHost == myHost {
+				continue
+			}
+			if _, exists := service.ExtraHosts[otherName]; !exists {
+				service.ExtraHosts[otherName] = []string{hostIPs[otherHost]}
+			}
+		}
+
+		project.Services[name] = service
+	}
+
+	return nil
+}
+
 
 func findComposeFile() (string, error) {
 	// Try common compose file names in order

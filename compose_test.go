@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/compose-spec/compose-go/v2/types"
@@ -144,7 +147,7 @@ func TestInjectExtraHosts(t *testing.T) {
 		}
 	})
 
-	t.Run("three hosts", func(t *testing.T) {
+	t.Run("three hosts cross-host entries", func(t *testing.T) {
 		project := &types.Project{
 			Services: types.Services{
 				"a": types.ServiceConfig{
@@ -186,6 +189,170 @@ func TestInjectExtraHosts(t *testing.T) {
 		cHosts := project.Services["c"].ExtraHosts
 		if len(cHosts) != 2 {
 			t.Errorf("service c should have 2 extra_hosts entries, got %d: %v", len(cHosts), cHosts)
+		}
+	})
+}
+
+func stubConnectivityCheck(failHosts map[string]bool) func(ctx context.Context, host string) error {
+	return func(ctx context.Context, host string) error {
+		if failHosts[host] {
+			return fmt.Errorf("connection refused")
+		}
+		return nil
+	}
+}
+
+func TestCheckHostsConnectivity(t *testing.T) {
+	t.Run("all hosts reachable", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = stubConnectivityCheck(nil)
+
+		hostDeployment := map[string][]string{
+			"ssh://user@host-a": {"web"},
+			"ssh://user@host-b": {"api"},
+		}
+
+		err := checkHostsConnectivity(context.Background(), hostDeployment)
+		if err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("single host unreachable", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = stubConnectivityCheck(map[string]bool{
+			"ssh://user@host-b": true,
+		})
+
+		hostDeployment := map[string][]string{
+			"ssh://user@host-a": {"web"},
+			"ssh://user@host-b": {"api"},
+		}
+
+		err := checkHostsConnectivity(context.Background(), hostDeployment)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "host-b") {
+			t.Errorf("error should mention host-b, got: %v", err)
+		}
+	})
+
+	t.Run("multiple hosts unreachable reports all", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = stubConnectivityCheck(map[string]bool{
+			"ssh://user@host-a": true,
+			"ssh://user@host-c": true,
+		})
+
+		hostDeployment := map[string][]string{
+			"ssh://user@host-a": {"web"},
+			"ssh://user@host-b": {"api"},
+			"ssh://user@host-c": {"db"},
+		}
+
+		err := checkHostsConnectivity(context.Background(), hostDeployment)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "host-a") {
+			t.Errorf("error should mention host-a, got: %v", errMsg)
+		}
+		if !strings.Contains(errMsg, "host-c") {
+			t.Errorf("error should mention host-c, got: %v", errMsg)
+		}
+		if strings.Contains(errMsg, "host-b") {
+			t.Errorf("error should not mention host-b (it succeeded), got: %v", errMsg)
+		}
+	})
+
+	t.Run("all hosts unreachable", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = stubConnectivityCheck(map[string]bool{
+			"ssh://user@host-a": true,
+			"ssh://user@host-b": true,
+		})
+
+		hostDeployment := map[string][]string{
+			"ssh://user@host-a": {"web"},
+			"ssh://user@host-b": {"api"},
+		}
+
+		err := checkHostsConnectivity(context.Background(), hostDeployment)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		errMsg := err.Error()
+		if !strings.Contains(errMsg, "host-a") {
+			t.Errorf("error should mention host-a, got: %v", errMsg)
+		}
+		if !strings.Contains(errMsg, "host-b") {
+			t.Errorf("error should mention host-b, got: %v", errMsg)
+		}
+	})
+
+	t.Run("empty deployment succeeds", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = stubConnectivityCheck(nil)
+
+		err := checkHostsConnectivity(context.Background(), map[string][]string{})
+		if err != nil {
+			t.Errorf("expected no error for empty deployment, got: %v", err)
+		}
+	})
+}
+
+func TestCheckHostConnectivity(t *testing.T) {
+	t.Run("reachable host returns nil", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = stubConnectivityCheck(nil)
+
+		err := checkHostConnectivity(context.Background(), "ssh://user@host-a")
+		if err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
+
+	t.Run("unreachable host wraps error with host name", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = stubConnectivityCheck(map[string]bool{
+			"ssh://user@host-a": true,
+		})
+
+		err := checkHostConnectivity(context.Background(), "ssh://user@host-a")
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "ssh://user@host-a") {
+			t.Errorf("error should contain the host URI, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "unreachable") {
+			t.Errorf("error should say unreachable, got: %v", err)
+		}
+	})
+
+	t.Run("respects context cancellation", func(t *testing.T) {
+		original := connectivityCheckFn
+		defer func() { connectivityCheckFn = original }()
+		connectivityCheckFn = func(ctx context.Context, host string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := checkHostConnectivity(ctx, "ssh://user@host-a")
+		if err == nil {
+			t.Fatal("expected error from cancelled context, got nil")
 		}
 	})
 }

@@ -6,7 +6,7 @@ services:
       - "8081:8000"
     restart: unless-stopped
     labels:
-      composure: ssh://gabe@melon.local
+      composure: ssh://gabe@kiwi.local
 
   # Nginx reverse proxy to hello-world across hosts
   nginx:

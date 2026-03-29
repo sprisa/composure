@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
+	"strings"
+	"sync"
+	"time"
 
 	composeCli "github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
@@ -50,6 +54,10 @@ func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
 		hostDeployment[host] = deploys
 	}
 
+	if err := checkHostsConnectivity(ctx, hostDeployment); err != nil {
+		return err
+	}
+
 	if err := injectExtraHosts(project, hostDeployment); err != nil {
 		return err
 	}
@@ -75,6 +83,59 @@ func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
 	}
 
 	return group.Wait()
+}
+
+var connectivityCheckFn = defaultConnectivityCheck
+
+func defaultConnectivityCheck(ctx context.Context, host string) error {
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "docker", "ps")
+	cmd.Env = append(os.Environ(), "DOCKER_HOST="+host)
+	cmd.Stdout = nil
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		if stderr.Len() > 0 {
+			return fmt.Errorf("%s: %w", strings.TrimSpace(stderr.String()), err)
+		}
+		return err
+	}
+	return nil
+}
+
+func checkHostsConnectivity(ctx context.Context, hostDeployment map[string][]string) error {
+	var (
+		mu   sync.Mutex
+		errs []error
+		wg   sync.WaitGroup
+	)
+
+	for host := range hostDeployment {
+		wg.Go(func() {
+			if err := checkHostConnectivity(ctx, host); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+		})
+	}
+
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+func checkHostConnectivity(ctx context.Context, host string) error {
+	l.Log.Info().Str("host", host).Msg("Checking connectivity")
+
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	if err := connectivityCheckFn(ctx, host); err != nil {
+		return fmt.Errorf("host %s is unreachable: %w", host, err)
+	}
+
+	l.Log.Info().Str("host", host).Msg("Host is reachable")
+	return nil
 }
 
 func runDockerCompose(
@@ -179,7 +240,6 @@ func injectExtraHosts(project *types.Project, hostDeployment map[string][]string
 
 	return nil
 }
-
 
 func findComposeFile() (string, error) {
 	// Try common compose file names in order

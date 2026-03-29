@@ -1,7 +1,7 @@
 {
   "package.json": {
     "name": "@sprisa/composure",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "description": "Deploy docker-compose files to multiple hosts via SSH with Composure",
     "license": "MPL-2.0",
     "author": "Gabriel Meola <banter@gabe.mx>",

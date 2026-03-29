@@ -5,10 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -16,26 +18,25 @@ import (
 	composeCli "github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
 	l "github.com/sprisa/x/log"
-	"golang.org/x/sync/errgroup"
 )
 
-func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
+func loadProject(ctx context.Context) (*types.Project, map[string][]string, error) {
 	// TODO: Use compose file from -f if available well
 	composeFile, err := findComposeFile()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	options, err := composeCli.NewProjectOptions(
 		[]string{composeFile},
 	)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	project, err := options.LoadProject(ctx)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
 	hostDeployment := map[string][]string{}
@@ -44,14 +45,16 @@ func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
 		if !hasHost {
 			continue
 		}
+		hostDeployment[host] = append(hostDeployment[host], service.Name)
+	}
 
-		deploys, hasDeployment := hostDeployment[host]
-		if !hasDeployment {
-			deploys = []string{}
-		}
+	return project, hostDeployment, nil
+}
 
-		deploys = append(deploys, service.Name)
-		hostDeployment[host] = deploys
+func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
+	project, hostDeployment, err := loadProject(ctx)
+	if err != nil {
+		return err
 	}
 
 	if err := checkHostsConnectivity(ctx, hostDeployment); err != nil {
@@ -62,27 +65,183 @@ func runComposeCmd(ctx context.Context, cmd string, flags []string) error {
 		return err
 	}
 
-	composeYAML, err := project.MarshalYAML()
+	reverse := cmd == "down"
+	// Foreground "up" (no -d) streams logs and blocks forever, so we launch
+	// all levels' goroutines without waiting between them. Otherwise the first
+	// level would block and subsequent hosts would never deploy.
+	blockBetweenLevels := !(cmd == "up" && !hasDetachFlag(flags))
+	return deployInOrder(ctx, project, hostDeployment, cmd, flags, reverse, blockBetweenLevels)
+}
+
+func hasDetachFlag(flags []string) bool {
+	for _, f := range flags {
+		if f == "-d" || f == "--detach" {
+			return true
+		}
+	}
+	return false
+}
+
+func shortHost(sshURI string) string {
+	if u, err := url.Parse(sshURI); err == nil && u.Hostname() != "" {
+		return u.Hostname()
+	}
+	return sshURI
+}
+
+func runPlanCmd(ctx context.Context) error {
+	project, hostDeployment, err := loadProject(ctx)
+	if err != nil {
+		return err
+	}
+	return writePlan(os.Stdout, project, hostDeployment)
+}
+
+func writePlan(w io.Writer, project *types.Project, hostDeployment map[string][]string) error {
+	serviceHost := map[string]string{}
+	for host, services := range hostDeployment {
+		for _, svc := range services {
+			serviceHost[svc] = host
+		}
+	}
+
+	hosts := make([]string, 0, len(hostDeployment))
+	for h := range hostDeployment {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+
+	for i, host := range hosts {
+		if i > 0 {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintf(w, "Host: %s\n", host)
+
+		services := make([]string, len(hostDeployment[host]))
+		copy(services, hostDeployment[host])
+		sort.Strings(services)
+
+		for _, name := range services {
+			svc := project.Services[name]
+			fmt.Fprintf(w, "  %s\n", name)
+			if svc.Image != "" {
+				fmt.Fprintf(w, "    image:   %s\n", svc.Image)
+			}
+			if svc.NetworkMode != "" {
+				fmt.Fprintf(w, "    network: %s\n", svc.NetworkMode)
+			}
+			if len(svc.Volumes) > 0 {
+				vols := make([]string, len(svc.Volumes))
+				for j, v := range svc.Volumes {
+					vols[j] = v.String()
+				}
+				fmt.Fprintf(w, "    volumes: %s\n", strings.Join(vols, ", "))
+			}
+		}
+	}
+
+	var crossDeps []string
+	for _, svc := range project.Services {
+		myHost, ok := serviceHost[svc.Name]
+		if !ok {
+			continue
+		}
+		for dep := range svc.DependsOn {
+			depHost, ok := serviceHost[dep]
+			if !ok || depHost == myHost {
+				continue
+			}
+			crossDeps = append(crossDeps,
+				fmt.Sprintf("  %s (%s) -> %s (%s)", svc.Name, shortHost(myHost), dep, shortHost(depHost)))
+		}
+	}
+	if len(crossDeps) > 0 {
+		sort.Strings(crossDeps)
+		fmt.Fprintf(w, "\nCross-host dependencies:\n")
+		for _, line := range crossDeps {
+			fmt.Fprintln(w, line)
+		}
+	}
+
+	levels, err := buildHostDeployOrder(project, hostDeployment)
 	if err != nil {
 		return err
 	}
 
-	group, ctx := errgroup.WithContext(ctx)
-
-	for host, services := range hostDeployment {
-		group.Go(func() error {
-			err := runDockerCompose(ctx, host, composeYAML, cmd, flags, services)
-			if err != nil {
-				l.Log.Err(err).
-					Str("host", host).
-					Msg("Deployment failed")
-				return err
-			}
-			return nil
-		})
+	fmt.Fprintf(w, "\nDeploy order:\n")
+	for i, level := range levels {
+		label := "parallel"
+		if len(level) == 1 {
+			label = "single"
+		}
+		fmt.Fprintf(w, "  Level %d (%s): %s\n", i+1, label, strings.Join(level, ", "))
 	}
 
-	return group.Wait()
+	return nil
+}
+
+var deployToHostFn = defaultDeployToHost
+
+func defaultDeployToHost(ctx context.Context, project *types.Project, host string, services []string, cmd string, flags []string) error {
+	filtered := filterProjectForHost(project, services)
+	composeYAML, err := filtered.MarshalYAML()
+	if err != nil {
+		return fmt.Errorf("host %s: failed to marshal compose YAML: %w", host, err)
+	}
+	return runDockerCompose(ctx, host, composeYAML, cmd, flags, services)
+}
+
+func deployInOrder(ctx context.Context, project *types.Project, hostDeployment map[string][]string, cmd string, flags []string, reverse bool, blockBetweenLevels bool) error {
+	levels, err := buildHostDeployOrder(project, hostDeployment)
+	if err != nil {
+		return err
+	}
+
+	if reverse {
+		for i, j := 0, len(levels)-1; i < j; i, j = i+1, j-1 {
+			levels[i], levels[j] = levels[j], levels[i]
+		}
+	}
+
+	var (
+		mu   sync.Mutex
+		errs []error
+		wg   sync.WaitGroup
+	)
+
+	for _, level := range levels {
+		if ctx.Err() != nil {
+			break
+		}
+
+		for _, host := range level {
+			services := hostDeployment[host]
+			wg.Go(func() {
+				if err := deployToHostFn(ctx, project, host, services, cmd, flags); err != nil {
+					l.Log.Err(err).Str("host", host).Msg("Deployment failed")
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+				}
+			})
+		}
+
+		// For foreground "up" (no -d), don't block between levels so all hosts
+		// can stream logs simultaneously. For "down", "restart", and "up -d",
+		// wait for each level to finish before starting the next.
+		if blockBetweenLevels {
+			wg.Wait()
+			if err := errors.Join(errs...); err != nil {
+				return err
+			}
+		}
+	}
+
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 var connectivityCheckFn = defaultConnectivityCheck
@@ -222,6 +381,15 @@ func injectExtraHosts(project *types.Project, hostDeployment map[string][]string
 	for name, service := range project.Services {
 		myHost := serviceHost[name]
 
+		if strings.HasPrefix(service.NetworkMode, "service:") ||
+			strings.HasPrefix(service.NetworkMode, "container:") {
+			l.Log.Warn().
+				Str("service", name).
+				Str("network_mode", service.NetworkMode).
+				Msg("Skipping extra_hosts injection for service with shared network namespace")
+			continue
+		}
+
 		if service.ExtraHosts == nil {
 			service.ExtraHosts = types.HostsList{}
 		}
@@ -239,6 +407,155 @@ func injectExtraHosts(project *types.Project, hostDeployment map[string][]string
 	}
 
 	return nil
+}
+
+func filterProjectForHost(project *types.Project, services []string) *types.Project {
+	keep := map[string]bool{}
+	for _, s := range services {
+		keep[s] = true
+	}
+
+	filtered := *project
+	filtered.Services = types.Services{}
+
+	for _, name := range services {
+		svc, exists := project.Services[name]
+		if !exists {
+			continue
+		}
+
+		if svc.DependsOn != nil {
+			cleanDeps := types.DependsOnConfig{}
+			for dep, config := range svc.DependsOn {
+				if keep[dep] {
+					cleanDeps[dep] = config
+				}
+			}
+			svc.DependsOn = cleanDeps
+		}
+
+		if after, ok := strings.CutPrefix(svc.NetworkMode, "service:"); ok {
+			ref := after
+			if !keep[ref] {
+				svc.NetworkMode = ""
+			}
+		}
+
+		filtered.Services[name] = svc
+	}
+
+	return &filtered
+}
+
+func buildHostDeployOrder(project *types.Project, hostDeployment map[string][]string) ([][]string, error) {
+	serviceHost := map[string]string{}
+	for host, services := range hostDeployment {
+		for _, svc := range services {
+			serviceHost[svc] = host
+		}
+	}
+
+	// deps[hostA] = {hostB: true} means A must wait for B
+	deps := map[string]map[string]bool{}
+	// crossHostEdges tracks service-level reasons: "service -> dep"
+	crossHostEdges := map[string]map[string][]string{}
+	for host := range hostDeployment {
+		deps[host] = map[string]bool{}
+		crossHostEdges[host] = map[string][]string{}
+	}
+
+	for _, service := range project.Services {
+		myHost, ok := serviceHost[service.Name]
+		if !ok {
+			continue
+		}
+		for dep := range service.DependsOn {
+			depHost, ok := serviceHost[dep]
+			if !ok || depHost == myHost {
+				continue
+			}
+			deps[myHost][depHost] = true
+			crossHostEdges[myHost][depHost] = append(
+				crossHostEdges[myHost][depHost],
+				fmt.Sprintf("%s -> %s", service.Name, dep),
+			)
+		}
+	}
+
+	inDegree := map[string]int{}
+	dependents := map[string][]string{}
+	for host := range hostDeployment {
+		inDegree[host] = len(deps[host])
+	}
+	for host, hostDeps := range deps {
+		for dep := range hostDeps {
+			dependents[dep] = append(dependents[dep], host)
+		}
+	}
+
+	var levels [][]string
+	var queue []string
+	for host, degree := range inDegree {
+		if degree == 0 {
+			queue = append(queue, host)
+		}
+	}
+
+	processed := 0
+	for len(queue) > 0 {
+		level := make([]string, len(queue))
+		copy(level, queue)
+		sort.Strings(level)
+		levels = append(levels, level)
+		processed += len(level)
+
+		var next []string
+		for _, host := range level {
+			for _, dependent := range dependents[host] {
+				inDegree[dependent]--
+				if inDegree[dependent] == 0 {
+					next = append(next, dependent)
+				}
+			}
+		}
+		queue = next
+	}
+
+	if processed != len(hostDeployment) {
+		cycleHostSet := map[string]bool{}
+		for host, degree := range inDegree {
+			if degree > 0 {
+				cycleHostSet[host] = true
+			}
+		}
+
+		var edgeLines []string
+		for from, targets := range crossHostEdges {
+			if !cycleHostSet[from] {
+				continue
+			}
+			for to, reasons := range targets {
+				if !cycleHostSet[to] {
+					continue
+				}
+				for _, r := range reasons {
+					edgeLines = append(edgeLines, fmt.Sprintf("  %s (%s depends on %s)", r, from, to))
+				}
+			}
+		}
+		sort.Strings(edgeLines)
+
+		l.Log.Warn().Msg(fmt.Sprintf("Circular cross-host dependency detected, deploying these hosts in parallel:\n%s", strings.Join(edgeLines, "\n")))
+
+		var remaining []string
+		for host := range cycleHostSet {
+			remaining = append(remaining, host)
+		}
+		sort.Strings(remaining)
+		levels = append(levels, remaining)
+	}
+
+	return levels, nil
 }
 
 func findComposeFile() (string, error) {

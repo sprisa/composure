@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
+	"syscall"
 
 	l "github.com/sprisa/x/log"
 )
@@ -16,7 +18,8 @@ func main() {
 		return
 	}
 	cmd := os.Args[1]
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	err := handleCmd(ctx, cmd)
 	if err != nil {
@@ -37,6 +40,8 @@ func handleCmd(ctx context.Context, cmd string) error {
 		}
 
 		return runComposeCmd(ctx, cmd, os.Args[2:])
+	case "plan":
+		return runPlanCmd(ctx)
 	case "help":
 		printAppHelp()
 		return nil
@@ -54,6 +59,7 @@ Commands:
   up       - Start services
   down     - Stop services
   restart  - Restart services
+  plan     - Show deployment plan
   help     - Show this help message
 `)
 }

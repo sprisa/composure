@@ -42,6 +42,8 @@ func handleCmd(ctx context.Context, cmd string) error {
 		return runComposeCmd(ctx, cmd, os.Args[2:])
 	case "plan":
 		return runPlanCmd(ctx)
+	case "setup":
+		return runSetup(ctx)
 	case "help":
 		printAppHelp()
 		return nil
@@ -60,6 +62,7 @@ Commands:
   down     - Stop services
   restart  - Restart services
   plan     - Show deployment plan
+  setup    - Setup shared volumes (NFS)
   help     - Show this help message
 `)
 }

@@ -88,6 +88,8 @@ Commands:
   up       - Start services
   down     - Stop services
   restart  - Restart services
+  plan     - Show deployment plan
+  setup    - Setup shared volumes (NFS)
   help     - Show this help message
 ```
 
@@ -129,6 +131,84 @@ Composure resolves each SSH host's IP at deploy time and adds the mappings autom
 > **Note:** Services communicate over the host network using published ports, not container ports. Ensure the relevant ports are exposed and accessible between hosts.
 
 
+## Shared Volumes (NFS)
+
+When services on different hosts need access to the same data, Composure can share volumes over NFS. Declare shared volumes using the `composure-nfs` driver in the top-level `volumes` block:
+
+```yaml
+volumes:
+  media:
+    driver: composure-nfs
+    driver_opts:
+      host: ssh://gabe@coconut.dvc.link   # Host that owns the data
+      path: /home/gabe/lib/plex            # Absolute path on that host
+
+services:
+  plex:
+    volumes:
+      - media:/data
+    labels:
+      composure: ssh://gabe@coconut.dvc.link
+
+  overseerr:
+    volumes:
+      - media:/data
+    labels:
+      composure: ssh://gabe@kiwi.dvc.link
+```
+
+During deployment, Composure rewrites these volumes per-host:
+- On the **source host** (`coconut`), the named volume becomes a local bind mount to `/home/gabe/lib/plex`
+- On **other hosts** (`kiwi`), it becomes an NFS mount pointing to `coconut`
+
+### One-time setup
+
+Before deploying, run `composure setup` to install NFS packages and configure exports. It will SSH into each host, create the source directories, and attempt to install packages via `sudo`. If `sudo` requires a password, you'll be prompted interactively. If it fails, the commands are printed for you to run manually.
+
+```sh
+composure setup
+```
+
+### Rendered Compose Files
+
+Each time you deploy, Composure writes the rendered docker-compose YAML to `~/.config/composure/<project>.yml` on each remote host. This is the final YAML after NFS volume rewriting and host filtering — exactly what `docker compose` sees. You can inspect it at any time:
+
+```sh
+ssh gabe@kiwi cat ~/.config/composure/plex.yml
+```
+
+### Debugging NFS
+
+If NFS mounts aren't working after setup, verify the configuration on the server host:
+
+```sh
+# Check the NFS server service is running
+sudo systemctl status nfs-server        # Fedora/Arch
+sudo systemctl status nfs-kernel-server # Debian/Ubuntu
+
+# View configured exports
+cat /etc/exports
+
+# View active exports
+sudo exportfs -v
+
+# Restart and re-export if needed
+sudo exportfs -ra
+sudo systemctl restart nfs-server
+```
+
+From a client host, verify the server is reachable:
+
+```sh
+# List exports available from the server
+showmount -e <server-hostname>
+
+# Test mount manually
+sudo mkdir -p /tmp/nfs-test
+sudo mount -t nfs4 <server-hostname>:/path/to/share /tmp/nfs-test
+ls /tmp/nfs-test
+sudo umount /tmp/nfs-test
+```
+
 ## Not Yet Supported
-- Cross host volumes
 - Cross host `service.depends_on`

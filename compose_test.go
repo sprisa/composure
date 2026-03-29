@@ -825,6 +825,32 @@ func TestFilterProjectForHostEdgeCases(t *testing.T) {
 			t.Errorf("expected 0 services, got %d", len(filtered.Services))
 		}
 	})
+
+	t.Run("does not mutate original volumes", func(t *testing.T) {
+		project := &types.Project{
+			Services: types.Services{
+				"web": types.ServiceConfig{Name: "web"},
+			},
+			Volumes: types.Volumes{
+				"data": types.VolumeConfig{Name: "data"},
+				"logs": types.VolumeConfig{Name: "logs"},
+			},
+		}
+
+		filtered := filterProjectForHost(project, []string{"web"})
+
+		delete(filtered.Volumes, "data")
+
+		if _, ok := project.Volumes["data"]; !ok {
+			t.Error("deleting from filtered.Volumes must not remove from original project.Volumes")
+		}
+		if len(project.Volumes) != 2 {
+			t.Errorf("original project should still have 2 volumes, got %d", len(project.Volumes))
+		}
+		if len(filtered.Volumes) != 1 {
+			t.Errorf("filtered project should have 1 volume after delete, got %d", len(filtered.Volumes))
+		}
+	})
 }
 
 func TestBuildHostDeployOrderEdgeCases(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -140,6 +141,40 @@ func writePlan(w io.Writer, project *types.Project, hostDeployment map[string][]
 		}
 	}
 
+	// Show composure-nfs volumes
+	var nfsLines []string
+	for name, vol := range project.Volumes {
+		if vol.Driver != composureNFSDriver {
+			continue
+		}
+		host := vol.DriverOpts["host"]
+		path := vol.DriverOpts["path"]
+
+		var users []string
+		for _, svc := range project.Services {
+			for _, v := range svc.Volumes {
+				if v.Type == types.VolumeTypeVolume && v.Source == name {
+					svcHost := serviceHost[svc.Name]
+					loc := "local"
+					if svcHost != host {
+						loc = "nfs"
+					}
+					users = append(users, fmt.Sprintf("%s (%s)", svc.Name, loc))
+				}
+			}
+		}
+		sort.Strings(users)
+		nfsLines = append(nfsLines, fmt.Sprintf("  %s: %s on %s -> %s",
+			name, path, shortHost(host), strings.Join(users, ", ")))
+	}
+	if len(nfsLines) > 0 {
+		sort.Strings(nfsLines)
+		fmt.Fprintf(w, "\nShared volumes (NFS):\n")
+		for _, line := range nfsLines {
+			fmt.Fprintln(w, line)
+		}
+	}
+
 	var crossDeps []string
 	for _, svc := range project.Services {
 		myHost, ok := serviceHost[svc.Name]
@@ -184,11 +219,19 @@ var deployToHostFn = defaultDeployToHost
 
 func defaultDeployToHost(ctx context.Context, project *types.Project, host string, services []string, cmd string, flags []string) error {
 	filtered := filterProjectForHost(project, services)
+	hasNFS := rewriteNFSVolumes(filtered, host)
 	composeYAML, err := filtered.MarshalYAML()
 	if err != nil {
 		return fmt.Errorf("host %s: failed to marshal compose YAML: %w", host, err)
 	}
-	return runDockerCompose(ctx, host, composeYAML, cmd, flags, services)
+	if err := writeRemoteComposeFile(ctx, host, filtered.Name, composeYAML); err != nil {
+		l.Log.Warn().Err(err).Str("host", host).Msg("Failed to write remote compose file")
+	}
+	err = runDockerCompose(ctx, host, composeYAML, cmd, flags, services)
+	if err != nil && hasNFS {
+		l.Log.Warn().Str("host", host).Msg("Deployment failed with NFS volumes — did you run 'composure setup'?")
+	}
+	return err
 }
 
 func deployInOrder(ctx context.Context, project *types.Project, hostDeployment map[string][]string, cmd string, flags []string, reverse bool, blockBetweenLevels bool) error {
@@ -294,6 +337,34 @@ func checkHostConnectivity(ctx context.Context, host string) error {
 	}
 
 	l.Log.Info().Str("host", host).Msg("Host is reachable")
+	return nil
+}
+
+func writeRemoteComposeFile(ctx context.Context, sshURI string, projectName string, composeYAML []byte) error {
+	u, err := url.Parse(sshURI)
+	if err != nil {
+		return fmt.Errorf("invalid SSH URI %q: %w", sshURI, err)
+	}
+
+	host := u.Hostname()
+	if port := u.Port(); port != "" {
+		host = host + ":" + port
+	}
+	user := u.User.Username()
+
+	args := []string{"-o", "ConnectTimeout=10"}
+	if user != "" {
+		args = append(args, "-l", user)
+	}
+	args = append(args, host, fmt.Sprintf("mkdir -p ~/.config/composure && cat > ~/.config/composure/%s.yml", projectName))
+
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	cmd.Stdin = bytes.NewReader(composeYAML)
+
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to write compose file: %s: %w", strings.TrimSpace(string(out)), err)
+	}
+
 	return nil
 }
 
@@ -409,6 +480,56 @@ func injectExtraHosts(project *types.Project, hostDeployment map[string][]string
 	return nil
 }
 
+// rewriteNFSVolumes modifies the project in-place, converting composure-nfs
+// volumes for the given host. On the source host the named volume becomes a
+// bind mount; on other hosts it becomes a real NFS volume. Returns true if
+// any composure-nfs volumes were present.
+func rewriteNFSVolumes(project *types.Project, host string) bool {
+	nfsVols := map[string]NFSVolume{}
+	for name, vol := range project.Volumes {
+		if vol.Driver != composureNFSDriver {
+			continue
+		}
+		nfsVols[name] = NFSVolume{Host: vol.DriverOpts["host"], Path: vol.DriverOpts["path"]}
+	}
+	if len(nfsVols) == 0 {
+		return false
+	}
+
+	for name, nfs := range nfsVols {
+		if nfs.Host == host {
+			// Source host: convert service volume references to bind mounts
+			for svcName, svc := range project.Services {
+				for i, v := range svc.Volumes {
+					if v.Type == types.VolumeTypeVolume && v.Source == name {
+						svc.Volumes[i].Type = types.VolumeTypeBind
+						svc.Volumes[i].Source = nfs.Path
+					}
+				}
+				project.Services[svcName] = svc
+			}
+			delete(project.Volumes, name)
+		} else {
+			// Remote host: rewrite top-level volume to NFS driver
+			ip, err := resolveHostIP(nfs.Host)
+			if err != nil {
+				ip = shortHost(nfs.Host)
+			}
+			project.Volumes[name] = types.VolumeConfig{
+				Name:   name,
+				Driver: "local",
+				DriverOpts: types.Options{
+					"type":   "nfs",
+					"o":      fmt.Sprintf("addr=%s,rw,nfsvers=4", ip),
+					"device": ":" + nfs.Path,
+				},
+			}
+		}
+	}
+
+	return true
+}
+
 func filterProjectForHost(project *types.Project, services []string) *types.Project {
 	keep := map[string]bool{}
 	for _, s := range services {
@@ -417,6 +538,10 @@ func filterProjectForHost(project *types.Project, services []string) *types.Proj
 
 	filtered := *project
 	filtered.Services = types.Services{}
+	// Deep-copy Volumes so concurrent rewriteNFSVolumes calls per host
+	// don't race on the same map (the struct copy above is shallow).
+	filtered.Volumes = types.Volumes{}
+	maps.Copy(filtered.Volumes, project.Volumes)
 
 	for _, name := range services {
 		svc, exists := project.Services[name]
